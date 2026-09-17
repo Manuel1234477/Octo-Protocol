@@ -81,11 +81,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Brings its own cargo-audit, so it is unaffected by the 1.84.1 toolchain pin — a current
-      # cargo-audit needs rustc 1.88+ and cannot be installed against this workspace's toolchain.
-      - uses: rustsec/audit-check@v2
+      # A prebuilt binary, deliberately not rustsec/audit-check: that action shells out to
+      # `cargo install cargo-audit`, which picks up the 1.84.1 pin in rust-toolchain.toml and
+      # fails, because a current cargo-audit needs rustc 1.88+. Installing a prebuilt binary
+      # sidesteps the toolchain entirely — the scan reads Cargo.lock and compiles nothing.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      # Invoked directly rather than as `cargo audit`, so the pinned cargo shim is not involved.
+      # Documented exceptions live in .cargo/audit.toml.
+      - name: Audit
+        run: cargo-audit audit
 
   deny:
     name: cargo-deny (licenses + advisories)
