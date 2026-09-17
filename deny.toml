@@ -2,6 +2,18 @@
 [advisories]
 version = 2
 yanked = "deny"
+# cargo-deny resolves a narrower graph than cargo-audit, so it only needs the two advisories that
+# actually match here; the lockfile-only ones live in .cargo/audit.toml. Listing an unmatched id
+# here would be reported as "no crate matched advisory criteria".
+# Re-check on every dependency bump — an exception that gains a reverse-dependency path stops
+# being an exception and becomes a real finding.
+ignore = [
+    # Reachable via stellar-base, but unmaintained-only with no safe upgrade published. Tracked as
+    # a dependency-replacement task rather than silently accepted forever.
+    "RUSTSEC-2022-0081",
+    # Unsoundness in a path we do not exercise: we never call Error::downcast_mut.
+    "RUSTSEC-2026-0190",
+]
 
 [licenses]
 version = 2
@@ -17,6 +29,8 @@ allow = [
     "Unicode-DFS-2016",
     "Zlib",
     "CC0-1.0",
+    # webpki-roots ships Mozilla's CA bundle; the data itself carries this permissive licence.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 

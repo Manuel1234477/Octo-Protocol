@@ -23,6 +23,8 @@ master.key
 
 CLAUDE.md
 PLAN.md
+FUTURE_FIXES.md
+SCF_APPLICATION.md
 tasks/
 
 # Keep reference material out of release artifacts but tracked
