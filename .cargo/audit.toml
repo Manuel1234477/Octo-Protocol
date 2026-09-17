@@ -1,0 +1,22 @@
+# cargo-audit configuration: https://github.com/rustsec/rustsec/tree/main/cargo-audit
+#
+# Every entry below is a lockfile-only advisory: the crate appears in Cargo.lock but no enabled
+# feature path reaches it, so it is never compiled into the server. Verified with
+# `cargo tree -i <crate> --target all`, which reports no reverse dependency for each.
+#
+# These are exceptions, not dismissals. Re-check on every dependency bump: if `cargo tree -i`
+# starts returning a path, the crate became reachable and the advisory became real.
+[advisories]
+ignore = [
+    # rsa: Marvin timing sidechannel, no fixed version published upstream. Pulled only by sqlx's
+    # MySQL auth; we build sqlx with default-features = false and the postgres feature only.
+    "RUSTSEC-2023-0071",
+
+    # quinn-proto: remote memory exhaustion over QUIC. No enabled path reaches it, and the fixed
+    # version (>=0.11.15) requires a newer rustc than the pinned 1.84.1 toolchain.
+    "RUSTSEC-2026-0185",
+
+    # rkyv: out-of-bounds read validating archives containing Rc/Arc. No enabled path reaches it;
+    # the fix (>=0.8.17) is a semver-major bump unavailable under the pinned toolchain.
+    "RUSTSEC-2026-0235",
+]

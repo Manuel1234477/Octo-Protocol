@@ -1,0 +1,17 @@
+# Reviewed false positives, pinned by fingerprint (commit:path:rule:line) so that history scanning
+# stays enabled and any *new* finding still fails the build. Verified individually — none of these
+# is a credential. Do not add an entry here without checking the matched value first.
+
+# Test fixture: a randomly generated token inside an ingest test. The file no longer exists at
+# HEAD (the EVM ingest work was reverted), but remains reachable in history.
+fa0d1f5f110b03c32ba1588a3bab0bc562aac949:crates/ingest/tests/evm_ingest_tests.rs:generic-api-key:536
+
+# Test fixture: the webhook signing secret a test constructs for its own local endpoint.
+2357114bbf82c42a54d783bd9ece7974217910b5:crates/ingest/tests/webhook_e2e_tests.rs:generic-api-key:208
+
+# A `fetch` request option, not a credential. From the duplicated frontend/ tree that was removed
+# from this repo in 81963e1.
+5315a08f0642779ffef4bc8391af8e5ae2818400:frontend/src/app/dashboard/audit/page.tsx:generic-api-key:21
+
+# Documentation: the sample curl request shown on the landing page, with a placeholder token.
+002e34fa51ce22294466d4f58e118457cd0011db:frontend/src/components/landing/Developers.tsx:curl-auth-header:3
