@@ -20,7 +20,7 @@ pub mod horizon;
 mod backfill_tests;
 
 use horizon::{HorizonPayments, PaymentRecord};
-use octo_store::{NewDeposit, Store};
+use octo_store::{NewDeposit, Store, Wallet};
 use octo_wallet_core::decode_muxed;
 use octo_webhooks::{Event, WebhookSender};
 use std::collections::HashMap;
@@ -464,9 +464,9 @@ pub enum IngestError {
 
 /// Supervises deposit ingestion across all wallets.
 ///
-/// On each tick it loads the wallet list and polls each one once (resuming from its cursor). This
-/// is a simple, restart-safe fan-out for the MVP; it can later be split into per-wallet workers or
-/// separate processes for scale without changing the cursor-based contract.
+/// On each tick it pages through the due wallets and polls each one once (resuming from its
+/// cursor). This is a simple, restart-safe fan-out for the MVP; it can later be split into
+/// per-wallet workers or separate processes for scale without changing the cursor-based contract.
 pub struct Supervisor {
     store: Store,
     horizon_url: String,
@@ -576,63 +576,115 @@ impl Supervisor {
 
         // Only wallets actually due under the backoff tiers — a dev/production DB accumulates
         // wallets that never transact again, and polling them every cycle starves the active ones
-        // of the shared concurrency budget.
-        let wallets = self
-            .store
-            .wallets_due_for_poll(
-                self.network,
-                Self::ACTIVE_AFTER_SECS,
-                Self::IDLE_INTERVAL_SECS,
-                Self::DORMANT_AFTER_SECS,
-                Self::DORMANT_INTERVAL_SECS,
-            )
-            .await?;
+        // of the shared concurrency budget. Paged by id so memory doesn't scale with wallet count.
         let semaphore = Arc::new(tokio::sync::Semaphore::new(Self::MAX_CONCURRENT_POLLS));
         let mut tasks = tokio::task::JoinSet::new();
-
-        for w in wallets {
-            let store = self.store.clone();
-            let store_for_mark = self.store.clone();
-            let horizon_url = self.horizon_url.clone();
-            let webhooks = self.webhooks.clone();
-            let tracker = self.tracker.clone();
-            let retry = self.retry.clone();
-            let circuit = self.circuit.clone();
-            let semaphore = semaphore.clone();
-            tasks.spawn(async move {
-                // Held for the duration of this wallet's poll; bounds how many Horizon requests
-                // are in flight at once without limiting how many wallets we *queue*.
-                let _permit = semaphore.acquire_owned().await;
-                let ingestor = Ingestor::new_with_resilience(
-                    store,
-                    &horizon_url,
-                    w.id,
-                    w.stellar_account_g.clone(),
-                    retry,
-                    circuit,
-                )
-                .with_webhooks(webhooks)
-                .with_tracker(tracker);
-                let result = ingestor.poll_once(page_limit).await;
-                // Record the attempt regardless of outcome, so a wallet whose polls keep failing
-                // still backs off instead of being retried at full rate forever.
-                let _ = store_for_mark.mark_polled(w.id).await;
-                (w.id, result)
-            });
-        }
-
         let mut total = 0;
-        while let Some(joined) = tasks.join_next().await {
-            match joined {
-                Ok((_wallet_id, Ok(n))) => total += n,
-                Ok((wallet_id, Err(e))) => {
-                    tracing::warn!(wallet = %wallet_id, error = ?e, "wallet poll failed")
+        let mut after_id = None;
+        let mut fetch_error = None;
+
+        loop {
+            let page = match self
+                .store
+                .wallets_due_for_poll_page(
+                    self.network,
+                    Self::ACTIVE_AFTER_SECS,
+                    Self::IDLE_INTERVAL_SECS,
+                    Self::DORMANT_AFTER_SECS,
+                    Self::DORMANT_INTERVAL_SECS,
+                    Some(Self::FANOUT_PAGE_SIZE),
+                    after_id,
+                )
+                .await
+            {
+                Ok(page) => page,
+                // Don't return yet: dropping the JoinSet would abort polls already in flight.
+                Err(e) => {
+                    fetch_error = Some(e);
+                    break;
                 }
-                Err(e) => tracing::warn!(error = ?e, "wallet poll task panicked"),
+            };
+            let is_last_page = (page.len() as i64) < Self::FANOUT_PAGE_SIZE;
+            after_id = page.last().map(|w| w.id);
+
+            for w in page {
+                self.spawn_poll(&mut tasks, &semaphore, w, page_limit);
+            }
+            if is_last_page {
+                break;
+            }
+            // Backpressure: keep at most about one page of queued tasks before loading the next.
+            while tasks.len() > Self::FANOUT_PAGE_SIZE as usize {
+                if let Some(joined) = tasks.join_next().await {
+                    total += Self::tally(joined);
+                }
             }
         }
-        Ok(total)
+
+        while let Some(joined) = tasks.join_next().await {
+            total += Self::tally(joined);
+        }
+        match fetch_error {
+            Some(e) => Err(e.into()),
+            None => Ok(total),
+        }
     }
+
+    /// Queue one wallet's poll on `tasks`, gated by the shared concurrency `semaphore`.
+    fn spawn_poll(
+        &self,
+        tasks: &mut tokio::task::JoinSet<(Uuid, Result<usize, IngestError>)>,
+        semaphore: &Arc<tokio::sync::Semaphore>,
+        w: Wallet,
+        page_limit: u32,
+    ) {
+        let store = self.store.clone();
+        let horizon_url = self.horizon_url.clone();
+        let webhooks = self.webhooks.clone();
+        let tracker = self.tracker.clone();
+        let retry = self.retry.clone();
+        let circuit = self.circuit.clone();
+        let semaphore = semaphore.clone();
+        tasks.spawn(async move {
+            // Held for the duration of this wallet's poll; bounds how many Horizon requests
+            // are in flight at once without limiting how many wallets we *queue*.
+            let _permit = semaphore.acquire_owned().await;
+            let ingestor = Ingestor::new_with_resilience(
+                store.clone(),
+                &horizon_url,
+                w.id,
+                w.stellar_account_g.clone(),
+                retry,
+                circuit,
+            )
+            .with_webhooks(webhooks)
+            .with_tracker(tracker);
+            let result = ingestor.poll_once(page_limit).await;
+            // Record the attempt regardless of outcome, so a wallet whose polls keep failing
+            // still backs off instead of being retried at full rate forever.
+            let _ = store.mark_polled(w.id).await;
+            (w.id, result)
+        });
+    }
+
+    /// Count records from one finished poll task, logging failures.
+    fn tally(joined: Result<(Uuid, Result<usize, IngestError>), tokio::task::JoinError>) -> usize {
+        match joined {
+            Ok((_wallet_id, Ok(n))) => n,
+            Ok((wallet_id, Err(e))) => {
+                tracing::warn!(wallet = %wallet_id, error = ?e, "wallet poll failed");
+                0
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "wallet poll task panicked");
+                0
+            }
+        }
+    }
+
+    /// Wallets fetched per page during the fan-out. Bounds both the query size and the number of
+    /// queued poll tasks (roughly two pages at most) regardless of total wallet count.
+    const FANOUT_PAGE_SIZE: i64 = 500;
 
     /// How many wallets to poll concurrently in one [`Supervisor::tick`] pass.
     const MAX_CONCURRENT_POLLS: usize = 20;

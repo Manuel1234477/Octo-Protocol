@@ -143,9 +143,10 @@ pub async fn relay_signed_transaction(
         ),
     };
 
-    // Record outbound payments in the history the dashboard lists (best-effort).
+    // Record outbound payments in the history the dashboard lists (best-effort). The store call
+    // is idempotent per tx hash, so `Ok(None)` (already recorded) is expected on a retry.
     if let Some(p) = &payment {
-        let _ = state
+        if let Err(e) = state
             .store()
             .record_withdrawal_transaction(
                 wallet_id,
@@ -157,7 +158,10 @@ pub async fn relay_signed_transaction(
                 hash.as_deref(),
                 status,
             )
-            .await;
+            .await
+        {
+            tracing::warn!(wallet = %wallet_id, error = ?e, "failed to record withdrawal history");
+        }
     }
 
     Ok(RelayOutcome {

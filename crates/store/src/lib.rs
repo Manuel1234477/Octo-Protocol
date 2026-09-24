@@ -487,11 +487,35 @@ impl Store {
         Ok(rows)
     }
 
-    /// List all wallets (used by the ingest supervisor to fan out poll loops).
+    /// List all wallets in one unbounded query. Kept for tests and tooling; the ingest supervisor
+    /// pages through [`Store::wallets_due_for_poll_page`] instead.
     pub async fn list_wallets(&self) -> Result<Vec<Wallet>, StoreError> {
         let rows = sqlx::query_as::<_, Wallet>("SELECT * FROM wallets ORDER BY created_at")
             .fetch_all(&self.pool)
             .await?;
+        Ok(rows)
+    }
+
+    /// One keyset page of all wallets, ordered by `id`. Pass the last row's id as `after_id` to
+    /// fetch the next page; an empty (or short) page means the end was reached. Ordering by the
+    /// unique primary key keeps pages free of gaps and duplicates.
+    pub async fn list_wallets_page(
+        &self,
+        limit: i64,
+        after_id: Option<Uuid>,
+    ) -> Result<Vec<Wallet>, StoreError> {
+        let rows = sqlx::query_as::<_, Wallet>(
+            r#"
+            SELECT * FROM wallets
+            WHERE ($1::uuid IS NULL OR id > $1)
+            ORDER BY id
+            LIMIT $2
+            "#,
+        )
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows)
     }
 
@@ -508,6 +532,8 @@ impl Store {
     ///   `dormant_interval_secs`
     ///
     /// A wallet with no cursor row has never been polled, so it is always due.
+    ///
+    /// Unbounded; prefer [`Store::wallets_due_for_poll_page`] when the wallet count can be large.
     pub async fn wallets_due_for_poll(
         &self,
         network: &str,
@@ -516,11 +542,40 @@ impl Store {
         dormant_after_secs: i64,
         dormant_interval_secs: i64,
     ) -> Result<Vec<Wallet>, StoreError> {
+        // `LIMIT NULL` is "no limit" in Postgres, so this is the paged query's full result.
+        self.wallets_due_for_poll_page(
+            network,
+            active_after_secs,
+            idle_interval_secs,
+            dormant_after_secs,
+            dormant_interval_secs,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// One keyset page of [`Store::wallets_due_for_poll`], ordered by `id`, with the exact same
+    /// backoff filter. Pass the last row's id as `after_id` for the next page; `limit = None`
+    /// returns everything. Paging on the unique primary key means no wallet is skipped or
+    /// returned twice across page boundaries within one pass.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn wallets_due_for_poll_page(
+        &self,
+        network: &str,
+        active_after_secs: i64,
+        idle_interval_secs: i64,
+        dormant_after_secs: i64,
+        dormant_interval_secs: i64,
+        limit: Option<i64>,
+        after_id: Option<Uuid>,
+    ) -> Result<Vec<Wallet>, StoreError> {
         let rows = sqlx::query_as::<_, Wallet>(
             r#"
             SELECT w.* FROM wallets w
             LEFT JOIN ingest_cursor c ON c.wallet_id = w.id
             WHERE w.network = $1
+              AND ($6::uuid IS NULL OR w.id > $6)
               -- Never polled, or never saw activity => always due.
               AND (
                 c.last_polled_at IS NULL
@@ -535,7 +590,8 @@ impl Store {
                        ELSE $3
                      END)
               )
-            ORDER BY w.created_at
+            ORDER BY w.id
+            LIMIT $7
             "#,
         )
         .bind(network)
@@ -543,6 +599,8 @@ impl Store {
         .bind(idle_interval_secs as f64)
         .bind(dormant_after_secs as f64)
         .bind(dormant_interval_secs as f64)
+        .bind(after_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
@@ -904,11 +962,16 @@ impl Store {
         Ok(found.is_some())
     }
 
-    /// Create a withdrawal intent. Idempotent on `(wallet_id, idempotency_key)`: a retried request
-    /// with the same key returns [`StoreError::Conflict`] instead of creating a second payout.
     /// Record a confirmed/failed outbound transfer in the `transactions` history (the table the
     /// dashboard lists). Withdrawals previously lived only in `withdrawals`, which is why they
     /// never showed up in "recent transactions".
+    ///
+    /// Idempotent on `(wallet_id, stellar_tx_hash)` (migration `0021`), matching
+    /// [`Store::record_deposit`]: returns `Ok(Some(tx))` when a row is inserted and `Ok(None)` when
+    /// this transfer is already recorded, so a retried status update can't double-list a payout.
+    /// The one exception is a retry that turns an earlier `failed` row into `confirmed` (e.g. the
+    /// first submit timed out but the same signed XDR later landed): that row is upgraded in place
+    /// and returned. A `confirmed` row is never downgraded.
     #[allow(clippy::too_many_arguments)]
     pub async fn record_withdrawal_transaction(
         &self,
@@ -920,13 +983,18 @@ impl Store {
         destination_account: &str,
         stellar_tx_hash: Option<&str>,
         status: &str,
-    ) -> Result<Transaction, StoreError> {
+    ) -> Result<Option<Transaction>, StoreError> {
+        // No row back means the conflict fired and the existing row was left as-is.
         let row = sqlx::query_as::<_, Transaction>(
             r#"
             INSERT INTO transactions
                 (wallet_id, direction, asset_code, asset_issuer, amount_stroops,
                  source_account, destination_account, stellar_tx_hash, status)
             VALUES ($1, 'withdrawal', $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (wallet_id, stellar_tx_hash)
+                WHERE stellar_tx_hash IS NOT NULL AND direction = 'withdrawal'
+            DO UPDATE SET status = EXCLUDED.status
+                WHERE transactions.status <> 'confirmed' AND EXCLUDED.status = 'confirmed'
             RETURNING *
             "#,
         )
@@ -938,11 +1006,13 @@ impl Store {
         .bind(destination_account)
         .bind(stellar_tx_hash)
         .bind(status)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
         Ok(row)
     }
 
+    /// Create a withdrawal intent. Idempotent on `(wallet_id, idempotency_key)`: a retried request
+    /// with the same key returns [`StoreError::Conflict`] instead of creating a second payout.
     pub async fn create_withdrawal(
         &self,
         new: NewWithdrawal<'_>,
@@ -1074,7 +1144,7 @@ impl Store {
             FROM sponsored_transactions
             WHERE wallet_id = $1
               AND status IN ('pending', 'confirmed')
-              AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
+              AND created_at >= date_trunc('day', now(), 'UTC')
             "#,
         )
         .bind(wallet_id)
@@ -1124,6 +1194,12 @@ impl Store {
     }
 
     /// Add an address to a wallet's withdrawal allowlist. `Conflict` if already present.
+    ///
+    /// Format validation is the **caller's** responsibility: `address` must already be a valid,
+    /// normalized base `G...` account (the API does this via `octo_wallet_core::to_base_account`).
+    /// The store stays free of Stellar-specific parsing, and an unvalidated or `M...` entry would
+    /// never match the normalized destination checked by [`Store::is_address_whitelisted`] —
+    /// an allowlist that accepts anything protects nothing.
     pub async fn add_whitelisted_address(
         &self,
         wallet_id: Uuid,
@@ -1578,10 +1654,30 @@ impl Store {
     /// Atomically reserve budget and record a sponsored transaction.
     ///
     /// Inserts a `pending` row **only if** doing so keeps today's reserved fees within
-    /// `daily_budget_stroops` (a `NULL` budget means unlimited). The check and insert happen in one
-    /// statement (a conditional CTE), so concurrent sponsorships can't oversubscribe the budget.
-    /// Returns `StoreError::BudgetExceeded` if the budget would be exceeded, or
-    /// `StoreError::Conflict` if this `inner_tx_hash` was already sponsored (double-submit).
+    /// `daily_budget_stroops` (a `NULL` budget means unlimited). Returns
+    /// `StoreError::BudgetExceeded` if the budget would be exceeded, `StoreError::NotFound` if the
+    /// wallet doesn't exist, or `StoreError::Conflict` if this `inner_tx_hash` was already
+    /// sponsored (double-submit).
+    ///
+    /// # Locking strategy
+    ///
+    /// The budget sum and the insert run in one transaction that first takes a `FOR NO KEY UPDATE`
+    /// row lock on the wallet's `wallets` row. A conditional CTE alone is not enough: under READ
+    /// COMMITTED every concurrent request would compute `spent` from a snapshot that can't see the
+    /// others' uncommitted inserts, so N requests near the ceiling could all pass the guard. The
+    /// row lock serializes check-and-insert per wallet (other wallets stay fully parallel), and
+    /// because the sum runs *after* the lock is granted it sees every reservation committed before.
+    /// `NO KEY` strength doesn't block the `FOR KEY SHARE` locks that foreign-key inserts (deposits,
+    /// addresses) take on the same row.
+    ///
+    /// # Day boundary
+    ///
+    /// "Today" is `date_trunc('day', now(), 'UTC')`, which is pinned to UTC regardless of the
+    /// session `TimeZone`. `now()` is the transaction start time and also becomes the row's
+    /// `created_at`, so every reservation is counted against exactly the UTC day it is stamped
+    /// with. A request that began before midnight but waited on the lock past it is still booked
+    /// (and checked) against the earlier day, and its sum has no upper bound, so it over-counts
+    /// rather than under-counts — neither day's budget can be exceeded.
     pub async fn try_reserve_sponsored_transaction(
         &self,
         wallet_id: Uuid,
@@ -1589,27 +1685,17 @@ impl Store {
         fee_stroops: i64,
         daily_budget_stroops: Option<i64>,
     ) -> Result<SponsoredTransaction, StoreError> {
-        // The read-then-insert below must be serialized per wallet. A bare conditional CTE is NOT
-        // enough: under READ COMMITTED every concurrent transaction computes `spent` from a
-        // snapshot taken before the others' inserts are visible, so N requests can each see the
-        // same total and all pass the budget guard (observed: 11 reservations against a 10-slot
-        // budget under 20 concurrent requests).
-        //
-        // A transaction-scoped advisory lock keyed on the wallet id makes the check-and-insert
-        // mutually exclusive for that wallet, while leaving other wallets fully parallel. The
-        // lock is released automatically when the transaction commits or rolls back.
         let mut tx = self.pool.begin().await?;
 
-        // Fold the wallet UUID into a stable i64 lock key.
-        let lock_key = {
-            let b = wallet_id.as_bytes();
-            i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-                ^ i64::from_be_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]])
-        };
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *tx)
-            .await?;
+        // Per-wallet serialization point; released on commit/rollback.
+        let locked: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM wallets WHERE id = $1 FOR NO KEY UPDATE")
+                .bind(wallet_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if locked.is_none() {
+            return Err(StoreError::NotFound);
+        }
 
         let result = sqlx::query_as::<_, SponsoredTransaction>(
             r#"
@@ -1618,7 +1704,7 @@ impl Store {
                 FROM sponsored_transactions
                 WHERE wallet_id = $1
                   AND status IN ('pending', 'confirmed')
-                  AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
+                  AND created_at >= date_trunc('day', now(), 'UTC')
             )
             INSERT INTO sponsored_transactions (wallet_id, inner_tx_hash, fee_stroops, status)
             SELECT $1, $2, $3, 'pending'
@@ -1713,7 +1799,7 @@ impl Store {
             FROM sponsored_transactions
             WHERE wallet_id = $1
               AND status = 'confirmed'
-              AND created_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
+              AND created_at >= date_trunc('day', now(), 'UTC')
             "#,
         )
         .bind(wallet_id)
